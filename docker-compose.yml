@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ${COMPOSE_PROJECT_NAME}-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-seafood}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-seafood_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-seafood}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-seafood} -d ${POSTGRES_DB:-seafood}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: ${COMPOSE_PROJECT_NAME}-redis
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  app:
+    build: .
+    container_name: ${COMPOSE_PROJECT_NAME}-app
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-seafood}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-seafood_pw}
+      PGNAME: ${POSTGRES_DB:-seafood}
+      REDIS_ADDR: redis:6379
+      APP_PORT: "8080"
+      TZ: Asia/Shanghai
+    ports:
+      - "${CC_PUBLISH_PORT}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

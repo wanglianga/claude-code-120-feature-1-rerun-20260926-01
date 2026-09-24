@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>海鲜预制菜批次追溯与召回系统</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="login-view" class="login-wrap hidden">
+  <form id="login-form" class="login-card">
+    <h1>🦐 海鲜预制菜工厂</h1>
+    <h2>批次解冻加工与召回系统</h2>
+    <input name="username" placeholder="用户名" autocomplete="username" required>
+    <input name="password" type="password" placeholder="密码" autocomplete="current-password" required>
+    <button type="submit">登 录</button>
+    <p id="login-err" class="err"></p>
+    <div class="demo-accounts">
+      <b>演示账号</b>
+      <span>admin/admin123（管理员）</span>
+      <span>manager/manager123（工厂经理）</span>
+      <span>quality/quality123（品控）</span>
+      <span>warehouse/ware123（仓管）</span>
+      <span>production/prod123（生产）</span>
+      <span>finance/finance123（财务）</span>
+    </div>
+  </form>
+</div>
+
+<div id="app-view" class="hidden">
+  <header class="topbar">
+    <div class="brand">🦐 批次解冻加工与召回系统</div>
+    <nav id="tabs"></nav>
+    <div class="user-box">
+      <span id="user-label"></span>
+      <button id="logout-btn" class="btn-mini">退出</button>
+    </div>
+  </header>
+  <main id="content"></main>
+</div>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3 id="modal-title"></h3>
+      <button id="modal-close" class="btn-mini">×</button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+<div id="toast" class="toast hidden"></div>
+<script src="/app.js"></script>
+</body>
+</html>
