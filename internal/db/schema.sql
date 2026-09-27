@@ -313,3 +313,69 @@ CREATE TABLE IF NOT EXISTS regulatory_samplings (
   result TEXT NOT NULL DEFAULT 'pending' CHECK (result IN ('pending','qualified','unqualified')),
   note TEXT
 );
+
+-- ============================================================
+-- 解冻超时锁批：复测判定 / 半成品隔离 / 降级 / 返工
+-- ============================================================
+
+-- 成品批次降级标记（ALTER 幂等，兼容已存在的库）
+ALTER TABLE finished_batches ADD COLUMN IF NOT EXISTS label_mark TEXT NOT NULL DEFAULT ''
+  CHECK (label_mark IN ('','normal','downgraded'));
+ALTER TABLE finished_batches ADD COLUMN IF NOT EXISTS label_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE finished_batches ADD COLUMN IF NOT EXISTS channel_restriction TEXT NOT NULL DEFAULT '';
+ALTER TABLE finished_batches ADD COLUMN IF NOT EXISTS rework_of_finished_id BIGINT REFERENCES finished_batches(id);
+
+-- 解冻超时锁批单：解冻间发现某批原料超时即锁批，暂停该批进入加工线
+CREATE TABLE IF NOT EXISTS thaw_locks (
+  id BIGSERIAL PRIMARY KEY,
+  lock_no TEXT UNIQUE NOT NULL,
+  raw_batch_id BIGINT NOT NULL REFERENCES raw_material_batches(id),
+  plan_id BIGINT REFERENCES production_plans(id),
+  thaw_record_id BIGINT REFERENCES thaw_records(id),
+  event_id BIGINT REFERENCES quality_events(id),
+  duration_minutes INT NOT NULL DEFAULT 0,
+  -- locked：锁批待复测；released：复测合格放行；downgraded：降级使用；rejected：复测不合格拒收
+  status TEXT NOT NULL DEFAULT 'locked'
+    CHECK (status IN ('locked','released','downgraded','rejected')),
+  locked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  locked_by BIGINT REFERENCES users(id),
+  -- 品控复测：中心温度 + 感官状态
+  retest_center_temp_c NUMERIC(5,2),
+  retest_sensory TEXT,                 -- 感官状态：色泽/气味/弹性
+  retest_result TEXT DEFAULT '' CHECK (retest_result IN ('','qualified','downgrade','unqualified')),
+  retest_by TEXT,
+  retest_at TIMESTAMPTZ,
+  retest_note TEXT,
+  -- 降级处置（retest_result='downgrade' 时填写）
+  label_text TEXT NOT NULL DEFAULT '',           -- 成品标签单独标记
+  channel_restriction TEXT NOT NULL DEFAULT '',  -- 限定销售渠道
+  allow_rework BOOLEAN NOT NULL DEFAULT false,   -- 已进入半成品时是否允许返工
+  -- 已进入半成品的隔离信息
+  semi_finished_id BIGINT REFERENCES finished_batches(id),
+  quarantine_location TEXT,
+  quarantine_result TEXT DEFAULT '' CHECK (quarantine_result IN ('','pending','qualified','unqualified')),
+  quarantine_note TEXT,
+  quarantined_by TEXT,
+  quarantined_at TIMESTAMPTZ,
+  closed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_thawlock_raw ON thaw_locks(raw_batch_id);
+CREATE INDEX IF NOT EXISTS idx_thawlock_status ON thaw_locks(status);
+
+-- 降级品成本核算：降级使用产生的差价损失与返工费用单独标记、独立核算
+CREATE TABLE IF NOT EXISTS downgrade_costs (
+  id BIGSERIAL PRIMARY KEY,
+  cost_no TEXT UNIQUE NOT NULL,
+  thaw_lock_id BIGINT REFERENCES thaw_locks(id),
+  raw_batch_id BIGINT REFERENCES raw_material_batches(id),
+  finished_batch_id BIGINT REFERENCES finished_batches(id),
+  qty_kg NUMERIC(10,2) NOT NULL DEFAULT 0,
+  normal_price NUMERIC(12,2) NOT NULL DEFAULT 0,   -- 正常品单价 元/kg
+  downgrade_price NUMERIC(12,2) NOT NULL DEFAULT 0,-- 降级品销售单价 元/kg
+  price_loss NUMERIC(12,2) NOT NULL DEFAULT 0,     -- 差价损失 = (正常价-降级价)*数量
+  rework_cost NUMERIC(12,2) NOT NULL DEFAULT 0,    -- 返工费用
+  total_cost NUMERIC(12,2) NOT NULL DEFAULT 0,     -- 合计损失
+  cost_center TEXT NOT NULL DEFAULT '降级品核算',   -- 单独成本中心标记
+  note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

@@ -10,11 +10,15 @@ func (s *Server) listFinished(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT f.id,f.batch_no,f.product_name,f.packaging_spec,f.qty_kg,
 		       f.cold_storage_location,f.status,f.produced_at::text,
+		       f.label_mark,f.label_text,f.channel_restriction,
+		       fb.batch_no AS rework_of_batch_no,
 		       (SELECT COALESCE(sum(qty_kg),0) FROM inventory i
 		         WHERE i.finished_batch_id=f.id AND i.status='available') AS stock_kg,
 		       (SELECT result FROM samples sm WHERE sm.finished_batch_id=f.id
 		         ORDER BY sm.taken_at DESC LIMIT 1) AS latest_sample
-		FROM finished_batches f ORDER BY f.produced_at DESC`)
+		FROM finished_batches f
+		LEFT JOIN finished_batches fb ON fb.id=f.rework_of_finished_id
+		ORDER BY f.produced_at DESC`)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -70,8 +74,13 @@ func (s *Server) finishedTrace(w http.ResponseWriter, r *http.Request) {
 
 	finRows, err := s.pool.Query(ctx, `
 		SELECT f.batch_no,f.product_name,f.packaging_spec,f.qty_kg,
-		       f.cold_storage_location,f.status,f.produced_at::text
-		FROM finished_batches f WHERE f.batch_no=$1`, bn)
+		       f.cold_storage_location,f.status,f.produced_at::text,
+		       COALESCE(f.label_mark,''),COALESCE(f.label_text,''),
+		       COALESCE(f.channel_restriction,''),
+		       COALESCE(fb.batch_no,'') AS rework_of_batch_no
+		FROM finished_batches f
+		LEFT JOIN finished_batches fb ON fb.id=f.rework_of_finished_id
+		WHERE f.batch_no=$1`, bn)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

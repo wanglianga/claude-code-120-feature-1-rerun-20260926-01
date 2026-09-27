@@ -1,6 +1,9 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
+	"strings"
+)
 
 type shipmentReq struct {
 	ShipNo      string            `json:"ship_no"`
@@ -38,10 +41,25 @@ func (s *Server) createShipment(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, it := range req.Items {
 		var finID int64
+		var labelMark, restrict string
 		if err := tx.QueryRow(ctx,
-			`SELECT id FROM finished_batches WHERE batch_no=$1`, it.FinishedBatchNo).Scan(&finID); err != nil {
+			`SELECT id,COALESCE(label_mark,''),COALESCE(channel_restriction,'')
+			 FROM finished_batches WHERE batch_no=$1`, it.FinishedBatchNo).
+			Scan(&finID, &labelMark, &restrict); err != nil {
 			writeErr(w, 404, "成品批次不存在："+it.FinishedBatchNo)
 			return
+		}
+		// 降级品限定渠道发货：仅允许发往复测结论指定的渠道（默认仅餐饮经销 CH04）
+		if labelMark == "downgraded" {
+			allowed := map[string]bool{}
+			for _, c := range strings.Split(restrict, ",") {
+				allowed[strings.TrimSpace(c)] = true
+			}
+			if !allowed[req.ChannelCode] {
+				writeErr(w, 409, "降级品 "+it.FinishedBatchNo+" 仅限渠道："+
+					s.channelNames(ctx, restrict)+"，不得发往 "+req.ChannelCode)
+				return
+			}
 		}
 		// 从可用库存扣减
 		tag, err := tx.Exec(ctx, `

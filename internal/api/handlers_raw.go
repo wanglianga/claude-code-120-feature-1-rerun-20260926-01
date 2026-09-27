@@ -171,10 +171,24 @@ func (s *Server) rawTrace(w http.ResponseWriter, r *http.Request) {
 
 	finished := queryMaps(`
 		SELECT f.batch_no, f.product_name, f.packaging_spec, f.qty_kg, f.status,
+		       COALESCE(f.label_mark,'') AS label_mark,
+		       COALESCE(f.label_text,'') AS label_text,
+		       COALESCE(f.channel_restriction,'') AS channel_restriction,
 		       l.qty_kg AS used_qty_kg
 		FROM batch_links l JOIN finished_batches f ON f.id=l.finished_batch_id
 		WHERE l.raw_batch_id=(SELECT id FROM raw_material_batches WHERE batch_no=$1)
 		ORDER BY f.produced_at`, batchNo)
+
+	thawLocks := queryMaps(`
+		SELECT l.lock_no,l.duration_minutes,l.status,l.locked_at::text,
+		       l.retest_center_temp_c,l.retest_sensory,l.retest_result,l.retest_at::text,
+		       l.label_text,l.channel_restriction,l.allow_rework,
+		       f.batch_no AS semi_finished_batch_no,l.quarantine_location,
+		       l.quarantine_result,l.quarantined_at::text
+		FROM thaw_locks l
+		LEFT JOIN finished_batches f ON f.id=l.semi_finished_id
+		WHERE l.raw_batch_id=(SELECT id FROM raw_material_batches WHERE batch_no=$1)
+		ORDER BY l.locked_at DESC`, batchNo)
 
 	samples := queryMaps(`
 		SELECT f.batch_no AS finished_batch_no, sm.sample_no, sm.result,
@@ -224,7 +238,8 @@ func (s *Server) rawTrace(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, 200, map[string]any{
 		"raw": raw, "temp_logs": tempLogs, "finished": finished,
-		"samples": samples, "shipments": shipments, "orders": orders,
+		"thaw_locks": thawLocks,
+		"samples":    samples, "shipments": shipments, "orders": orders,
 		"events": events, "recalls": recalls,
 	})
 }

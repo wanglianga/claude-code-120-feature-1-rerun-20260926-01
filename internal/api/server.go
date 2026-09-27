@@ -91,6 +91,15 @@ func (s *Server) Router() http.Handler {
 			r.Get("/events", s.listEvents)
 			r.With(role("quality", "admin", "manager")).Post("/events", s.createEvent)
 
+			// 解冻超时锁批：复测 / 半成品隔离 / 返工 / 排程避批 / 降级成本
+			r.Get("/thaw-locks", s.listThawLocks)
+			r.Get("/thaw-locks/{id}", s.getThawLock)
+			r.With(role("quality", "admin", "manager")).Post("/thaw-locks/{id}/retest", s.retestLock)
+			r.With(role("quality", "warehouse", "admin", "manager")).Post("/thaw-locks/{id}/isolate", s.isolateSemi)
+			r.With(role("production", "quality", "admin", "manager")).Post("/thaw-locks/{id}/rework", s.reworkSemi)
+			r.Get("/schedule-materials", s.scheduleMaterials)
+			r.Get("/downgrade-costs", s.listDowngradeCosts)
+
 			// 召回
 			r.Get("/recalls", s.listRecalls)
 			r.With(role("quality", "admin", "manager")).Post("/recalls", s.createRecall)

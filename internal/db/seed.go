@@ -214,6 +214,70 @@ func Seed(ctx context.Context, p *pgxpool.Pool) error {
 		 SELECT 'EV20260903-01','temp_exceed','major',id,'RM20260903 入库温度 -15.1℃，高于冻品限值 -18℃','open',3
 		 FROM raw_material_batches WHERE batch_no='RM20260903'
 		 ON CONFLICT (event_no) DO NOTHING`,
+
+		// ===== 解冻超时锁批演示场景（RM20260920：解冻 305 分钟超时，已进入半成品）=====
+
+		// 新鱿鱼原料：入库温度正常，解冻环节超时
+		`INSERT INTO raw_material_batches
+		 (batch_no,supplier_id,species,catch_or_production_date,inbound_temp_c,quarantine_cert,box_no,location,qty_kg,status,created_by)
+		 SELECT 'RM20260920',id,'鱿鱼','2026-09-18',-18.30,'QY2026-0020','BX-U-020','冷库A-04',200,'locked',1 FROM suppliers WHERE code='S003'
+		 ON CONFLICT (batch_no) DO NOTHING`,
+
+		// 在制计划：已上 L2 产线，解冻后完成清洗/切配/调味，停在包装前（半成品阶段）
+		`INSERT INTO production_plans(plan_no,product_name,line_id,target_qty_kg,packaging_spec,required_seasoning_batch,status,created_by)
+		 SELECT 'PP20260925-01','麻辣鱿鱼花',id,150,'商超定制 500g 简包（降级后限餐饮渠道）','T002','processing',1 FROM production_lines WHERE code='L2'
+		 ON CONFLICT (plan_no) DO NOTHING`,
+
+		// 解冻记录：06:00→11:05 共 305 分钟，超过 240 分钟限值
+		`INSERT INTO thaw_records(plan_id,raw_batch_id,start_at,end_at,center_temp_c,water_batch_no,operator)
+		 SELECT p.id,r.id,'2026-09-25 06:00+08','2026-09-25 11:05+08',4.50,'W-260925-01','刘解冻'
+		 FROM production_plans p, raw_material_batches r
+		 WHERE p.plan_no='PP20260925-01' AND r.batch_no='RM20260920'
+		   AND NOT EXISTS(SELECT 1 FROM thaw_records t WHERE t.plan_id=p.id AND t.raw_batch_id=r.id)`,
+
+		// 已完成三道工序：清洗、切配、调味（半成品已形成，尚未包装/金检/完工）
+		`INSERT INTO process_records(plan_id,stage,operator,value_num,value_text,ok,note)
+		 SELECT p.id,s.st,'马加工',s.vn,s.vt,s.ok,s.nt FROM production_plans p
+		 CROSS JOIN (VALUES
+		   ('wash','清水三道漂洗',NULL::numeric,'电导率 880us/cm',true,''),
+		   ('trim','切花刀',NULL,'4cm 花刀',true,''),
+		   ('season','按 T002 投料',NULL,'T002',true,'麻辣腌料 7.5kg，调味后待包装')
+		 ) AS s(st,nt,vn,vt,ok,ign)
+		 WHERE p.plan_no='PP20260925-01'
+		   AND NOT EXISTS(SELECT 1 FROM process_records pr WHERE pr.plan_id=p.id)`,
+
+		// 半成品批次（调味后、包装前），150kg 暂存在待包装区
+		`INSERT INTO finished_batches(batch_no,plan_id,product_name,packaging_spec,qty_kg,cold_storage_location,status,created_by)
+		 SELECT 'FG20260925-S1',id,'麻辣鱿鱼花(半成品·调味后待包装)','待包装',150,'冷库C-03-待包装暂存','in_stock',1
+		 FROM production_plans WHERE plan_no='PP20260925-01'
+		 ON CONFLICT (batch_no) DO NOTHING`,
+
+		`INSERT INTO batch_links(finished_batch_id,raw_batch_id,qty_kg)
+		 SELECT f.id,r.id,150 FROM finished_batches f, raw_material_batches r
+		 WHERE f.batch_no='FG20260925-S1' AND r.batch_no='RM20260920'
+		 ON CONFLICT DO NOTHING`,
+
+		`INSERT INTO inventory(finished_batch_id,location,qty_kg,status)
+		 SELECT id,'冷库C-03-待包装暂存',150,'available' FROM finished_batches WHERE batch_no='FG20260925-S1'
+		 ON CONFLICT DO NOTHING`,
+
+		// 解冻超时品控事件（open，等待品控复测闭环）
+		`INSERT INTO quality_events(event_no,etype,severity,raw_batch_id,description,status,created_by)
+		 SELECT 'EV20260920-01','thaw_timeout','major',id,
+		        '解冻用时 305 分钟，超过限值 240 分钟（计划 PP20260925-01，用水批次 W-260925-01），已自动锁批；该批已进入半成品（FG20260925-S1）',
+		        'open',3
+		 FROM raw_material_batches WHERE batch_no='RM20260920'
+		 ON CONFLICT (event_no) DO NOTHING`,
+
+		// 活动锁批单：原料/计划/解冻/事件/半成品全关联，等待复测 → 隔离 → 返工
+		`INSERT INTO thaw_locks(lock_no,raw_batch_id,plan_id,thaw_record_id,event_id,duration_minutes,status,locked_by,semi_finished_id)
+		 SELECT 'LK20260920-01',r.id,p.id,t.id,e.id,305,'locked',3,f.id
+		 FROM raw_material_batches r, production_plans p, thaw_records t,
+		      quality_events e, finished_batches f
+		 WHERE r.batch_no='RM20260920' AND p.plan_no='PP20260925-01'
+		   AND t.plan_id=p.id AND t.raw_batch_id=r.id
+		   AND e.event_no='EV20260920-01' AND f.batch_no='FG20260925-S1'
+		 ON CONFLICT (lock_no) DO NOTHING`,
 	}
 	for _, s := range stmts {
 		if _, err := p.Exec(ctx, s); err != nil {
