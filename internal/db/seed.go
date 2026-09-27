@@ -214,6 +214,56 @@ func Seed(ctx context.Context, p *pgxpool.Pool) error {
 		 SELECT 'EV20260903-01','temp_exceed','major',id,'RM20260903 入库温度 -15.1℃，高于冻品限值 -18℃','open',3
 		 FROM raw_material_batches WHERE batch_no='RM20260903'
 		 ON CONFLICT (event_no) DO NOTHING`,
+
+		// ===== 解冻超时锁批演示场景（鱿鱼 RM20260905）=====
+		// 新到鱿鱼原料，入库温度正常
+		`INSERT INTO raw_material_batches
+		 (batch_no,supplier_id,species,catch_or_production_date,inbound_temp_c,quarantine_cert,box_no,location,qty_kg,status,created_by)
+		 SELECT 'RM20260905',id,'鱿鱼','2026-09-19',-18.30,'QY2026-0005','BX-U-005','冷库A-05',300,'in_storage',1
+		 FROM suppliers WHERE code='S003'
+		 ON CONFLICT (batch_no) DO NOTHING`,
+
+		// 生产计划：鱿鱼圈（解冻超时后被暂停，locked）
+		`INSERT INTO production_plans(plan_no,product_name,line_id,target_qty_kg,packaging_spec,required_seasoning_batch,status,created_by)
+		 SELECT 'PP20260920-01','椒盐鱿鱼圈',id,120,'餐饮经销 1kg 简包','T002','planned',1 FROM production_lines WHERE code='L1'
+		 ON CONFLICT (plan_no) DO NOTHING`,
+
+		// 解冻记录：06:00-11:10，共 310 分钟，超过 240 分钟限值
+		`INSERT INTO thaw_records(plan_id,raw_batch_id,start_at,end_at,center_temp_c,water_batch_no,operator)
+		 SELECT p.id,r.id,'2026-09-20 06:00+08','2026-09-20 11:10+08',4.20,'W-260920-05','刘解冻'
+		 FROM production_plans p, raw_material_batches r
+		 WHERE p.plan_no='PP20260920-01' AND r.batch_no='RM20260905'
+		   AND NOT EXISTS(SELECT 1 FROM thaw_records t WHERE t.plan_id=p.id)`,
+
+		// 解冻超时品控事件（open，待复测处置）
+		`INSERT INTO quality_events(event_no,etype,severity,raw_batch_id,description,status,created_by)
+		 SELECT 'EV20260920-01','thaw_timeout','major',id,
+		        '解冻用时 310 分钟，超过限值 240 分钟（计划 PP20260920-01，用水批次 W-260920-05），暂停该批进入加工线并锁批待复测',
+		        'open',3
+		 FROM raw_material_batches WHERE batch_no='RM20260905'
+		 ON CONFLICT (event_no) DO NOTHING`,
+
+		// 锁批档案（pending）：关联事件/原料/计划/解冻记录
+		`INSERT INTO thaw_locks(lock_no,event_id,raw_batch_id,plan_id,thaw_record_id,duration_minutes,allowed_minutes,created_by)
+		 SELECT 'TL20260920-01',e.id,r.id,p.id,t.id,310,240,3
+		 FROM quality_events e, raw_material_batches r, production_plans p, thaw_records t
+		 WHERE e.event_no='EV20260920-01' AND r.batch_no='RM20260905'
+		   AND p.plan_no='PP20260920-01' AND t.plan_id=p.id
+		 ON CONFLICT (lock_no) DO NOTHING`,
+
+		// 锁批：原料锁定、计划暂停并记录被锁定的原料
+		`UPDATE raw_material_batches SET status='locked' WHERE batch_no='RM20260905' AND status='in_storage'`,
+		`UPDATE production_plans p SET status='locked',locked_raw_batch_id=r.id
+		 FROM raw_material_batches r
+		 WHERE p.plan_no='PP20260920-01' AND r.batch_no='RM20260905' AND p.status='planned'`,
+
+		// 锁批期间已有一部分进入半成品（切花工序）：隔离待检，等待录入检测结果与是否允许返工
+		`INSERT INTO semi_finished_quarantines
+		 (quarantine_no,thaw_lock_id,raw_batch_id,plan_id,stage,qty_kg,location,test_result,status)
+		 SELECT 'SQ20260920-01',tl.id,r.id,p.id,'trim',60,'冷库隔离区-Q01',NULL,'isolated'
+		 FROM thaw_locks tl, raw_material_batches r, production_plans p
+		 WHERE tl.lock_no='TL20260920-01' AND r.batch_no='RM20260905' AND p.plan_no='PP20260920-01'
+		   AND NOT EXISTS(SELECT 1 FROM semi_finished_quarantines WHERE quarantine_no='SQ20260920-01')`,
 	}
 	for _, s := range stmts {
 		if _, err := p.Exec(ctx, s); err != nil {

@@ -9,7 +9,8 @@ import (
 func (s *Server) listFinished(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT f.id,f.batch_no,f.product_name,f.packaging_spec,f.qty_kg,
-		       f.cold_storage_location,f.status,f.produced_at::text,
+		       f.cold_storage_location,f.status,f.is_downgraded,f.downgrade_label,
+		       f.downgrade_channels,f.produced_at::text,
 		       (SELECT COALESCE(sum(qty_kg),0) FROM inventory i
 		         WHERE i.finished_batch_id=f.id AND i.status='available') AS stock_kg,
 		       (SELECT result FROM samples sm WHERE sm.finished_batch_id=f.id
@@ -70,7 +71,8 @@ func (s *Server) finishedTrace(w http.ResponseWriter, r *http.Request) {
 
 	finRows, err := s.pool.Query(ctx, `
 		SELECT f.batch_no,f.product_name,f.packaging_spec,f.qty_kg,
-		       f.cold_storage_location,f.status,f.produced_at::text
+		       f.cold_storage_location,f.status,f.is_downgraded,f.downgrade_label,
+		       f.downgrade_channels,f.downgrade_note,f.produced_at::text
 		FROM finished_batches f WHERE f.batch_no=$1`, bn)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -110,9 +112,15 @@ func (s *Server) finishedTrace(w http.ResponseWriter, r *http.Request) {
 		WHERE p.id=(SELECT plan_id FROM finished_batches WHERE batch_no=$1)`, bn)
 
 	samples := qm(`
-		SELECT sample_no,result,taken_at::text,tested_at::text,lab_note,inspector
+		SELECT sample_no,sample_kind,result,taken_at::text,tested_at::text,lab_note,inspector
 		FROM samples WHERE finished_batch_id=(SELECT id FROM finished_batches WHERE batch_no=$1)
 		ORDER BY taken_at`, bn)
+
+	costMarks := qm(`
+		SELECT mark_no,label_mark,channel_restriction,unit_cost,standard_cost,loss_amount,cost_note,marked_at::text
+		FROM batch_cost_marks
+		WHERE finished_batch_id=(SELECT id FROM finished_batches WHERE batch_no=$1)
+		ORDER BY marked_at`, bn)
 
 	shipments := qm(`
 		SELECT sh.ship_no,ch.code AS channel_code,ch.name AS channel,ch.ctype,
@@ -157,7 +165,8 @@ func (s *Server) finishedTrace(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, 200, map[string]any{
 		"finished": fin[0], "raw_materials": raws, "thaw_records": thaws,
-		"samples": samples, "shipments": shipments, "orders": orders,
+		"samples": samples, "cost_marks": costMarks,
+		"shipments": shipments, "orders": orders,
 		"inventory": inventory, "returns": returns,
 		"events": events, "recalls": recalls,
 	})

@@ -74,6 +74,17 @@ func (s *Server) Router() http.Handler {
 			r.With(role("production", "admin", "manager")).Post("/plans/{id}/process", s.addProcess)
 			r.With(role("production", "admin", "manager")).Post("/plans/{id}/finish", s.finishPlan)
 
+			// 解冻超时锁批：复测 / 处置 / 半成品隔离检测 / 返工
+			r.Get("/thaw-locks", s.listThawLocks)
+			r.Get("/thaw-locks/{id}", s.getThawLock)
+			r.With(role("quality", "admin", "manager")).Post("/thaw-locks/{id}/retest", s.addRetest)
+			r.With(role("quality", "admin", "manager")).Post("/thaw-locks/{id}/dispose", s.disposeLock)
+			r.With(role("production", "warehouse", "quality", "admin", "manager")).Post("/thaw-locks/{id}/semi", s.createSemiQuarantine)
+			r.With(role("quality", "admin", "manager")).Post("/semi-quarantines/{id}/result", s.semiResult)
+			r.With(role("quality", "production", "admin", "manager")).Post("/semi-quarantines/{id}/rework", s.reworkSemi)
+			r.With(role("quality", "warehouse", "admin", "manager")).Post("/semi-quarantines/{id}/destroy", s.destroySemi)
+			r.Get("/cost-marks", s.listCostMarks)
+
 			// 成品 / 留样
 			r.Get("/finished-batches", s.listFinished)
 			r.Get("/finished-batches/{batchNo}/trace", s.finishedTrace)

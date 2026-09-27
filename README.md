@@ -52,7 +52,7 @@ docker compose down
 | --- | --- | --- | --- |
 | `admin` | `admin123` | 系统管理员 | 全部功能与全部写操作 |
 | `manager` | `manager123` | 工厂经理 | 全部业务读写（召回、退货判定、财务确认） |
-| `quality` | `quality123` | 品控主管 | 品控事件、留样检测、发起召回、退货判定、监管抽样、渠道反馈 |
+| `quality` | `quality123` | 品控主管 | 品控事件、留样检测、发起召回、退货判定、监管抽样、渠道反馈、**解冻锁批复测与处置、半成品检测/返工判定** |
 | `warehouse` | `ware123` | 冷库仓管 | 冻品入库、补测温、发货出库、退货登记、冷库盘点 |
 | `production` | `prod123` | 产线班长 | 下发计划、解冻记录、加工七步、完工入冷库、发货、订单 |
 | `finance` | `finance123` | 财务专员 | 消费者赔付支付、供应商扣款确认/扣款 |
@@ -73,6 +73,10 @@ docker compose down
 - 计划/成品：
   - `PP20260910-01 → FG20260912-01 蒜香虾仁`（直播间 250g 彩包，留样 SP-001 合格）；
   - `PP20260910-02 → FG20260912-02 麻辣鱿鱼花`（商超 500g 简包，使用问题鱿鱼原料，解冻 290 分钟已超时，留样 SP-002 合格）。
+- **解冻超时锁批场景**：`RM20260905` 鱿鱼（在库正常）→ 计划 `PP20260920-01 椒盐鱿鱼圈`，
+  解冻 06:00–11:10 共 **310 分钟**超过限值 240 分钟，已自动生成事件 `EV20260920-01`、
+  锁批单 `TL20260920-01`（待复测）：原料锁定、计划转「锁批暂停」、排程自动避开；
+  另有 60kg 已切花半成品隔离在 `冷库隔离区-Q01`（隔离单 `SQ20260920-01`，待检测/返工判定）。
 - 渠道：`CH01 盒马(商超)`、`CH02 天猫(电商)`、`CH03 抖音直播间`、`CH04 餐饮经销`。
 - 发货单 `SH20260913-01/02`，已售订单 `OD20260914-001/002/003、OD20260915-010`（精确到箱号）。
 - 渠道反馈：直播间就 `FG20260912-02` 反馈异味。
@@ -80,6 +84,13 @@ docker compose down
 
 ### 建议演示路径（端到端走一遍召回闭环）
 
+0. **解冻超时锁批闭环（本次新增）**：在「解冻锁批」打开 `TL20260920-01` →
+   品控录入**复测中心温度与感官状态**（选「建议降级」）→ 提交**降级使用**处置
+   （默认仅 `CH04 餐饮经销`，成品标签「降级品·解冻超时·限餐饮渠道」）；
+   对隔离半成品 `SQ20260920-01` 录入检测合格并勾选「允许返工」→ **返工**产出新成品
+   （系统**重新生成一条返工留样**、继承降级标记并写降级成本台账：标准 40 元/kg、
+   降级 24 元/kg、损失 16 元/kg）；在「渠道履约」把降级成品发往 `CH01 商超` 会被拦截，
+   发往 `CH04` 成功。也可复测「合格」放行（计划恢复加工）或「不合格」销毁（原料销毁、排程持续避开）。
 1. 「原料入库」→ 打开 `RM20260903` 的**正向追溯**：可见它进入成品 `FG20260912-02`、发往直播渠道、已售订单与留样结果。
 2. 「品控事件」→ 对 `EV20260903-01` **发起召回**：系统自动圈定关联原料/成品、锁定批次、隔离在库库存、标记已发货渠道与已售订单（精确到箱），并一次性生成**停售通知 / 退货指令 / 消费者赔偿 / 供应商追责**四类材料，同时生成赔付与供应商扣款台账。
 3. 「召回管理」→ 打开召回档案查看 9 个板块与全部材料。
@@ -95,7 +106,14 @@ docker compose down
 | --- | --- |
 | 冻品接收记录供应商/捕捞生产日期/入库温度/检疫证明/箱号/库位 | 原料批次入库登记；入库温度 > -18℃ 自动锁定并写温控报警 |
 | 仓储温控 | 随时补测温，超标自动锁定原料批次 |
-| 解冻记录（开始时间/中心温度/用水批次/操作人） | 解冻记录；**超过 240 分钟自动生成「解冻超时」事件**（数据库生成列计算时长） |
+| 解冻记录（开始时间/中心温度/用水批次/操作人） | 解冻记录；**超过 240 分钟自动生成「解冻超时」事件并锁批**（数据库生成列计算时长） |
+| 解冻超时锁批：暂停进入加工线 | `thaw_locks` 锁批档案；原料 `locked`、计划转 `locked`，加工/完工接口直接拦截，**生产排程自动避开该原料** |
+| 品控复测中心温度与感官状态 | 锁批复测 `retest`：中心温度 + 感官（色泽/气味/弹性），结论 合格/建议降级/不合格；未复测禁止处置 |
+| 复测合格放行 | 原料回在库、计划解除暂停恢复 `thawing`，事件结案 |
+| 复测不合格销毁 | 原料转 `destroyed`、计划保持锁定，排程持续避开 |
+| 降级使用：标签/渠道/成本单独标记 | 原料 `downgraded`；成品 `is_downgraded` + 降级标签 + 限定渠道；`batch_cost_marks` 记标准成本（40 元/kg）、降级成本（60%=24 元/kg）与降级损失；发往非允许渠道发货被拦截 |
+| 锁批期间已进入半成品 | `semi_finished_quarantines` 记录隔离库位、工序、数量、检测结果、是否允许返工；不合格不得返工只能销毁 |
+| 半成品返工 | 检测合格且允许返工可返工产出新成品入库，**重新生成 `sample_kind=rework` 返工留样**，继承降级标记并写成本台账 |
 | 清洗/切配/调味/称重/包装/金检/留样/成品冷库 | 加工七步留痕；调味批次与计划指定不一致→「调味料用错」；金检不合格→「金检报警」；包装不合格→「包装漏气」 |
 | 多条生产线并行 | 生产线档案，计划绑定产线，L1/L2 并行 |
 | 渠道定制包装 | 计划与成品批次记录包装规格（如直播间 250g 彩包、商超 500g 简包） |
@@ -120,6 +138,8 @@ docker compose down
 - 总览/档案：`GET /dashboard`、`/suppliers`、`/lines`、`/channels`、`/seasonings`
 - 原料：`GET/POST /raw-batches`、`POST /raw-batches/{batchNo}/temp-logs`、`GET /raw-batches/{batchNo}/trace`
 - 生产：`GET/POST /plans`、`POST /plans/{id}/thaw`、`POST /plans/{id}/process`、`POST /plans/{id}/finish`
+- 解冻超时锁批：`GET /thaw-locks`、`GET /thaw-locks/{id}`、`POST /thaw-locks/{id}/retest`（品控复测中心温度/感官）、`POST /thaw-locks/{id}/dispose`（放行/降级/销毁）、`POST /thaw-locks/{id}/semi`（半成品隔离登记）、`GET /cost-marks`（降级成本台账）
+- 半成品隔离：`POST /semi-quarantines/{id}/result`（检测结果+是否允许返工）、`POST /semi-quarantines/{id}/rework`（返工并重新留样）、`POST /semi-quarantines/{id}/destroy`（不合格销毁）
 - 成品：`GET /finished-batches`、`GET /finished-batches/{batchNo}/trace`、`POST /finished-batches/{batchNo}/sample`
 - 渠道：`GET/POST /shipments`、`GET/POST /orders`、`GET/POST /feedback`
 - 品控/召回：`GET/POST /events`、`GET/POST /recalls`、`GET /recalls/{id}`、`POST /recalls/{id}/close`
@@ -158,3 +178,65 @@ curl -s -b /tmp/ck $BASE/api/raw-batches/RM20260903/trace | head -c 400
 安全与运维要点：多阶段 Dockerfile（golang:1.23-alpine 构建，alpine:3.20 运行）；
 运行用户为非 root 的 `appuser`(uid 10001)；镜像内置 `HEALTHCHECK`；compose 中
 PostgreSQL/Redis 均有 healthcheck，app 依赖两者健康后再启动；PostgreSQL 数据持久化到命名卷。
+
+---
+
+## 七、本地开发与验证方式
+
+### Docker（推荐，与演示一致）
+
+见第一节：`cp .env.example .env && docker compose up -d --build`，服务启动自动迁移+播种，
+浏览器访问 `http://<宿主IP>:${CC_PUBLISH_PORT:-3120}`，用测试账号登录后进入「解冻锁批」页操作。
+
+### 本地裸跑（无 Docker 时，可用任意 PostgreSQL 14+ / Redis 7）
+
+```bash
+# 1) 准备依赖（示例：库内自建实例）
+initdb -D ./pgdata -U seafood --auth=trust
+echo "listen_addresses='127.0.0.1'" >> ./pgdata/postgresql.conf
+pg_ctl -D ./pgdata -l pg.log start
+createdb -h 127.0.0.1 -U seafood seafood
+redis-server --daemonize yes --port 6379
+
+# 2) 构建运行（需要 Go 1.23+）
+go build -o seafood ./cmd/server
+PGHOST=127.0.0.1 PGPORT=5432 PGPASSWORD=ignored PGUSER=seafood PGNAME=seafood \
+REDIS_ADDR=127.0.0.1:6379 APP_PORT=8080 ./seafood
+
+# 3) 健康检查
+curl -fsS http://127.0.0.1:8080/healthz   # => {"status":"ok"}
+```
+
+### 锁批接口快速自测
+
+```bash
+BASE=http://127.0.0.1:8080
+# 品控登录
+curl -s -c /tmp/ck -X POST $BASE/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"quality","password":"quality123"}'
+# 查看锁批（种子 TL20260920-01）
+curl -s -b /tmp/ck $BASE/api/thaw-locks | jq '.[0]'
+# 复测（建议降级）→ 处置（降级）
+curl -s -b /tmp/ck -X POST $BASE/api/thaw-locks/1/retest -H 'Content-Type: application/json' \
+  -d '{"center_temp_c":3.8,"sensory":"色泽略暗无氨味弹性稍差","result":"degrade"}'
+curl -s -b /tmp/ck -X POST $BASE/api/thaw-locks/1/dispose -H 'Content-Type: application/json' \
+  -d '{"disposition":"downgrade","downgrade_channels":"CH04","downgrade_label":"降级品·解冻超时·限餐饮渠道"}'
+```
+
+### 本次实际执行的验证（2026-09-26）
+
+在隔离工作区内使用 **Go 1.23.4 编译通过**（`go build ./...`、`go vet ./...` 均无错误），
+并以**本地 PostgreSQL 15 + Redis 7** 裸跑服务完成两组共 **41 项接口断言全部通过**：
+
+- 锁批主流程（24 项）：超时自动生成事件+锁批、未复测禁处置、锁批期加工 409 拦截、
+  复测/处置一致性校验、降级处置（原料 downgraded/计划恢复）、半成品检测与返工、
+  返工留样 `sample_kind=rework`、成本标记（标准 2200 / 单价 24 / 损失 880，按 55kg）、
+  降级品发 CH04 成功而发 CH01 返回 409、双向追溯含锁批与成本、事件结案、仪表盘 KPI。
+- 边界场景（17 项）：解冻 250 分钟自动锁批、复测合格放行后加工恢复、
+  复测不合格销毁（原料 destroyed、计划保持 locked、加工持续拦截）、
+  不合格半成品返工被拦截并可销毁、降级原料直接完工自动打标（100kg 损失 1600）。
+- 原有召回闭环回归通过：`RM20260903` 正向追溯、一键召回（圈定成品/订单/隔离库存/生成四类材料）、
+  退货三态处置、监管抽样不合格自动生成召回事件；前端静态资源 `/`、`/app.js`、`/styles.css` 均 200。
+
+> 说明：验证环境没有 Docker daemon，因此使用等价的本地 PG/Redis 裸跑完成端到端验证；
+> 生产交付仍以第一节的 Docker Compose 一键部署为准（schema 启动自动迁移、演示数据幂等播种）。

@@ -43,6 +43,22 @@ func (s *Server) createShipment(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "成品批次不存在："+it.FinishedBatchNo)
 			return
 		}
+		// 降级品销售渠道单独标记：只允许发往降级名单内渠道
+		var dg bool
+		var dgCh *string
+		if err := tx.QueryRow(ctx,
+			`SELECT is_downgraded,downgrade_channels FROM finished_batches WHERE id=$1`, finID).
+			Scan(&dg, &dgCh); err == nil && dg {
+			restriction := ""
+			if dgCh != nil {
+				restriction = *dgCh
+			}
+			if !channelAllowed(restriction, req.ChannelCode) {
+				writeErr(w, 409,
+					"成品 "+it.FinishedBatchNo+" 为解冻超时降级品，仅限渠道 "+restriction+" 销售，禁止发往 "+req.ChannelCode)
+				return
+			}
+		}
 		// 从可用库存扣减
 		tag, err := tx.Exec(ctx, `
 			UPDATE inventory SET qty_kg=qty_kg-$2, updated_at=now()

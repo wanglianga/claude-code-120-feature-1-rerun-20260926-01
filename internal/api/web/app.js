@@ -34,14 +34,18 @@ function fmtNum(v, d = 2) { return v === null || v === undefined ? '' : Number(v
 
 const STATUS_TAG = {
   in_storage: ['gray', '在库'], locked: ['amber', '锁定待判'], consumed: ['gray', '已耗用'],
-  recalled: ['red', '召回'], destroyed: ['red', '已销毁'],
-  in_stock: ['green', '成品在库'], released: ['blue', '已放行'], quarantined: ['amber', '隔离'],
-  reworked: ['purple', '返工'], available: ['green', '可用'],
-  open: ['amber', '待处置'], executing: ['red', '执行中'], closed: ['gray', '已结案'],
+  recalled: ['red', '召回'], destroyed: ['red', '已销毁'], downgraded: ['purple', '降级使用'],
+  in_stock: ['green', '成品在库'], released: ['green', '已放行'], quarantined: ['amber', '隔离'],
+  reworked: ['purple', '返工'], available: ['green', '可用'], isolated: ['amber', '隔离中'],
+  open: ['amber', '待处置'], executing: ['red', '执行中'], closed: ['gray', '已结案'], pending: ['amber', '待复测/待处理'],
   sold: ['blue', '已售'], returned: ['amber', '已退货'], compensated: ['green', '已赔付'],
-  shipped: ['blue', '已发货'], pending: ['amber', '待处理'], paid: ['green', '已赔付'],
+  shipped: ['blue', '已发货'], paid: ['green', '已赔付'],
   confirmed: ['blue', '已确认'], deducted: ['green', '已扣款'],
-  qualified: ['green', '合格'], unqualified: ['red', '不合格'],
+  qualified: ['green', '合格'], unqualified: ['red', '不合格'], degrade: ['purple', '建议降级'],
+};
+const LOCK_STATUS = {
+  pending: ['amber', '待复测'], released: ['green', '复测合格·放行'],
+  downgraded: ['purple', '降级使用'], destroyed: ['red', '销毁'],
 };
 const ETYPE = {
   temp_exceed: '原料温度超标', thaw_timeout: '解冻超时', seasoning_mismatch: '调味料批次用错',
@@ -55,6 +59,11 @@ const can = (...roles) => roles.includes(state.user.role) || state.user.role ===
 function tag(status) {
   const t = STATUS_TAG[status];
   if (!t) return `<span class="tag gray">${esc(status)}</span>`;
+  return `<span class="tag ${t[0]}">${t[1]}</span>`;
+}
+function lockTag(status) {
+  const t = LOCK_STATUS[status];
+  if (!t) return tag(status);
   return `<span class="tag ${t[0]}">${t[1]}</span>`;
 }
 
@@ -87,7 +96,7 @@ $('#logout-btn').addEventListener('click', async () => {
 
 const TABS = [
   ['dashboard', '仪表盘'], ['raw', '原料入库'], ['production', '生产加工'],
-  ['finished', '成品批次'], ['channel', '渠道履约'], ['events', '品控事件'],
+  ['thawlock', '解冻锁批'], ['finished', '成品批次'], ['channel', '渠道履约'], ['events', '品控事件'],
   ['recalls', '召回管理'], ['returns', '退货处置'], ['inventory', '冷库库存'],
   ['finance', '财务追偿'], ['sampling', '监管抽样'],
 ];
@@ -108,7 +117,7 @@ function render() {
   $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === state.tab));
   const pages = {
     dashboard: pageDashboard, raw: pageRaw, production: pageProduction,
-    finished: pageFinished, channel: pageChannel, events: pageEvents,
+    thawlock: pageThawLock, finished: pageFinished, channel: pageChannel, events: pageEvents,
     recalls: pageRecalls, returns: pageReturns, inventory: pageInventory,
     finance: pageFinance, sampling: pageSampling,
   };
@@ -191,6 +200,9 @@ async function pageDashboard() {
     `<div class="cards">
       ${kpi(d.raw_total, '原料批次总数')}
       ${kpi(d.raw_locked, '原料锁定待判', d.raw_locked ? 'warn' : 'ok')}
+      ${kpi(d.thaw_locks_pending, '解冻锁批待复测', d.thaw_locks_pending ? 'warn' : 'ok')}
+      ${kpi(d.thaw_semi_pending, '半成品隔离待判', d.thaw_semi_pending ? 'warn' : 'ok')}
+      ${kpi(d.downgraded_finished, '降级成品批次', d.downgraded_finished ? 'warn' : 'ok')}
       ${kpi(d.finished_total, '成品批次总数')}
       ${kpi(d.stock_kg + ' kg', '成品可用库存')}
       ${kpi(d.quarantine_kg + ' kg', '召回隔离库存', d.quarantine_kg ? 'danger' : '')}
@@ -202,6 +214,9 @@ async function pageDashboard() {
     </div>
     <div class="panel"><h3>建议演示路径</h3><div class="panel-body">
       <div class="flow-note">
+        ⓪ 新增：「解冻锁批」中 <b>TL20260920-01</b> 鱿鱼解冻 310 分钟超时已自动锁批、计划暂停、半成品隔离 →
+        品控<b>复测中心温度/感官</b> → 判定<b>降级使用</b>（或放行/销毁）；隔离半成品录入检测结果后<b>返工</b>，
+        返工成品<b>重新生成留样</b>，降级成品标签/渠道/成本单独标记，发往非允许渠道会被拦截；<br>
         ① 在「原料入库」查看 RM20260903（入库温度 -15.1℃ 自动锁定）→ 点「正向追溯」看它流入成品 FG20260912-02；<br>
         ② 在「品控事件」对 <b>EV20260903-01</b> 发起召回，系统自动圈定成品、已发货渠道、在库库存、已售订单（精确到箱）与留样结果，并生成停售/退货/赔偿/供应商追责四类材料；<br>
         ③ 在「召回管理」打开召回单查看材料；「退货处置」登记退货并分别判定 可复检/可返工/必须销毁，观察库存状态变化；<br>
@@ -304,6 +319,22 @@ async function showRawTrace(bn) {
         { t: '召回号', k: 'recall_no' }, { t: '级别', k: 'level' },
         { t: '状态', k: 'status', tag: true }, { t: '原因', k: 'reason', cls: 'wrap' },
       ], d.recalls)}</div></div>
+      <div class="panel full"><h3>解冻超时锁批记录（暂停加工 · 品控复测 · 处置）</h3><div class="panel-body">${table([
+        { t: '锁批号', k: 'lock_no' }, { t: '计划', k: 'plan_no' },
+        { t: '解冻时长(分)', fn: x => `${x.duration_minutes}（限值 ${x.allowed_minutes}）` },
+        { t: '复测中心温', fn: x => x.retest_center_temp_c != null ? fmtNum(x.retest_center_temp_c) + '℃' : '' },
+        { t: '感官状态', k: 'retest_sensory' },
+        { t: '复测结论', fn: x => x.retest_result ? tag(x.retest_result) : '' },
+        { t: '锁批状态', fn: x => lockTag(x.status) },
+        { t: '降级标签', k: 'downgrade_label' }, { t: '限定渠道', k: 'downgrade_channels' },
+      ], d.thaw_locks || [])}</div></div>
+      <div class="panel full"><h3>降级成品成本单独标记</h3><div class="panel-body">${table([
+        { t: '标记号', k: 'mark_no' }, { t: '成品批号', k: 'finished_batch_no' },
+        { t: '成品标签', k: 'label_mark' }, { t: '限定渠道', k: 'channel_restriction' },
+        { t: '标准成本', fn: x => '¥' + fmtNum(x.standard_cost) },
+        { t: '降级单价/kg', fn: x => '¥' + fmtNum(x.unit_cost) },
+        { t: '降级损失', fn: x => `<b style="color:#b91c1c">¥${fmtNum(x.loss_amount)}</b>` },
+      ], d.cost_marks || [])}</div></div>
     </div>`);
   $$('button[data-fin]').forEach(b => b.onclick = () => { closeModal(); showFinTrace(b.dataset.fin); });
 }
@@ -317,17 +348,21 @@ async function pageProduction() {
   $('#content').innerHTML = pageHead('生产计划 · 解冻间 · 加工线', '多条产线并行；解冻记录开始/结束时间、中心温度、用水批次、操作人；加工七步全程留痕', acts) +
     `<div class="panel"><div class="table-wrap"><table><thead><tr>
       <th>计划号</th><th>产品</th><th>产线</th><th>目标kg</th><th>渠道定制包装</th><th>指定调味料</th><th>状态</th><th>操作</th>
-      </tr></thead><tbody>${plans.map(p => `<tr>
+      </tr></thead><tbody>${plans.map(p => `<tr${p.status === 'locked' ? ' class="row-locked"' : ''}>
         <td>${esc(p.plan_no)}</td><td>${esc(p.product_name)}</td>
         <td>${esc(p.code)} ${esc(p.name)}</td><td>${fmtNum(p.target_qty_kg)}</td>
         <td>${esc(p.packaging_spec)}</td><td>${esc(p.required_seasoning_batch)}</td>
-        <td>${tag(p.status === 'finished' ? 'closed' : p.status === 'planned' ? 'pending' : 'executing')}</td>
+        <td>${p.status === 'locked'
+            ? `<span class="tag red">锁批暂停</span><div class="sub">问题原料 ${esc(p.locked_raw_batch_no || '')}，排程自动避开</div>`
+            : tag(p.status === 'finished' ? 'closed' : p.status === 'planned' ? 'pending' : 'executing')}</td>
         <td>
           ${can('production', 'manager') ? `
           <button class="act amber" data-thaw="${p.id}">解冻记录</button>
-          <button class="act" data-proc="${p.id}">加工记录</button>
-          <button class="act green" data-finish="${p.id}" ${p.status === 'finished' ? 'disabled' : ''}>完工入冷库</button>` : ''}
-        </td></tr>`).join('')}</tbody></table></div></div>`;
+          <button class="act" data-proc="${p.id}" ${p.status === 'locked' ? 'disabled' : ''}>加工记录</button>
+          <button class="act green" data-finish="${p.id}" ${p.status === 'finished' || p.status === 'locked' ? 'disabled' : ''}>完工入冷库</button>` : ''}
+        </td></tr>`).join('')}</tbody></table></div></div>
+    <div class="panel"><div class="flow-note">排程规则：解冻记录超过 <b>240 分钟</b> 自动生成品控事件并锁批——该批原料暂停进入加工线，
+      计划转「锁批暂停」，加工/完工接口直接拦截；请前往「解冻锁批」页完成品控复测（中心温度+感官状态）与处置。</div></div>`;
   $('#new-plan')?.addEventListener('click', () => modalForm('下发生产计划', [
     { name: 'plan_no', label: '计划号 *' }, { name: 'product_name', label: '产品名称 *' },
     { name: 'line_code', label: '生产线（多线并行）', type: 'select', opts: lines.map(l => ({ v: l.code, t: l.code + ' ' + l.name })) },
@@ -345,8 +380,10 @@ async function pageProduction() {
     { name: 'operator', label: '操作人' },
   ], async b => {
     const r = await api(`/plans/${btn.dataset.thaw}/thaw`, { method: 'POST', body: b });
-    toast(r.auto_event_no ? '解冻超时，已自动生成品控事件 ' + r.auto_event_no : `解冻记录成功（${r.duration_minutes} 分钟）`,
-      r.auto_event_no ? 'err' : 'ok');
+    toast(r.locked
+      ? `解冻超时 ${r.duration_minutes} 分钟：已生成事件 ${r.auto_event_no} 并锁批 ${r.thaw_lock_no}，计划暂停，请前往「解冻锁批」复测处置`
+      : `解冻记录成功（${r.duration_minutes} 分钟）`,
+      r.locked ? 'err' : 'ok');
   }, '提交解冻记录'));
 
   $$('button[data-proc]').forEach(btn => btn.onclick = () => modalForm('加工线记录 · 计划 ' + btn.dataset.thaw, [
@@ -379,6 +416,198 @@ async function pageProduction() {
   }, '确认完工'));
 }
 
+/* ---------- 解冻超时锁批 ---------- */
+
+async function pageThawLock() {
+  const [locks, costs] = await Promise.all([api('/thaw-locks'), api('/cost-marks')]);
+  $('#content').innerHTML = pageHead('解冻超时锁批 · 复测 · 降级 · 半成品返工',
+    '解冻超过 240 分钟自动锁批：暂停该批进入加工线、排程自动避开；品控复测中心温度与感官状态；降级成品标签/渠道/成本单独标记；半成品隔离记录库位/检测/返工') +
+    `<div class="panel"><h3>锁批批次（超时自动锁定）</h3>${table([
+      { t: '锁批号', k: 'lock_no' }, { t: '原料批次', k: 'raw_batch_no' }, { t: '品类', k: 'species' },
+      { t: '生产计划', k: 'plan_no' },
+      { t: '解冻时长', fn: r => `<b style="color:#b91c1c">${r.duration_minutes} 分钟</b>（限值 ${r.allowed_minutes}）` },
+      { t: '复测中心温', fn: r => r.retest_center_temp_c != null ? fmtNum(r.retest_center_temp_c) + ' ℃' : '' },
+      { t: '感官状态', k: 'retest_sensory' },
+      { t: '复测结论', fn: r => r.retest_result ? tag(r.retest_result) : '<span class="tag gray">未复测</span>' },
+      { t: '半成品隔离', fn: r => `${r.semi_count} 批 / ${fmtNum(r.semi_kg)}kg` },
+      { t: '锁批状态', fn: r => lockTag(r.status) },
+      { t: '操作', fn: r => `<button class="act" data-lock="${r.id}">锁批档案/处置</button>` },
+    ], locks)}</div>
+    <div class="panel"><h3>降级成本单独核算台账（标签 / 销售渠道 / 标准成本 / 降级损失）</h3>${table([
+      { t: '标记号', k: 'mark_no' }, { t: '锁批号', k: 'lock_no' }, { t: '原料', k: 'raw_batch_no' },
+      { t: '成品批号', k: 'finished_batch_no' }, { t: '成品标签', k: 'label_mark' },
+      { t: '限定渠道', k: 'channel_restriction' },
+      { t: '标准成本', fn: r => '¥' + fmtNum(r.standard_cost) },
+      { t: '降级单价', fn: r => '¥' + fmtNum(r.unit_cost) + '/kg' },
+      { t: '降级损失', fn: r => `<b style="color:#b91c1c">¥${fmtNum(r.loss_amount)}</b>` },
+      { t: '备注', k: 'cost_note', cls: 'wrap' },
+    ], costs)}</div>`;
+  $$('button[data-lock]').forEach(b => b.onclick = () => showThawLock(b.dataset.lock));
+}
+
+async function showThawLock(id) {
+  const d = await api(`/thaw-locks/${id}`);
+  const l = d.lock;
+  const canQC = can('quality', 'manager');
+  const canProd = can('production', 'warehouse', 'quality', 'manager');
+  const semiRows = d.semi_quarantines;
+  const costRows = d.cost_marks;
+
+  const actionBar = () => {
+    if (l.status !== 'pending') return '';
+    if (!l.retest_result) {
+      return canQC ? `<div class="form-actions"><button class="act amber" id="tl-retest">🧪 品控复测（中心温度+感官状态）</button></div>` : '';
+    }
+    // 已复测：处置按钮，结论与复测绑定
+    const map = { qualified: ['normal_release', '复测合格 → 放行，恢复加工排程'],
+      degrade: ['downgrade', '按复测建议降级使用（标签/渠道/成本单独标记）'],
+      unqualified: ['destroy', '复测不合格 → 原料销毁，排程持续避开'] };
+    const [disp, text] = map[l.retest_result];
+    return canQC ? `<div class="form-actions"><button class="act ${disp === 'destroy' ? 'red' : disp === 'downgrade' ? 'amber' : 'green'}"
+      data-disp="${disp}" id="tl-dispose">${text}</button></div>` : '';
+  };
+
+  modalView(`锁批档案 ${l.lock_no}`, `
+    <div class="flow-note">
+      原料 <b>${esc(l.raw_batch_no)}</b>（${esc(l.species)}，${fmtNum(l.qty_kg)}kg）解冻用时
+      <b style="color:#b91c1c">${l.duration_minutes} 分钟</b>，超过限值 ${l.allowed_minutes} 分钟，已暂停进入加工线；
+      生产计划 ${esc(l.plan_no || '—')}；事件 ${esc(l.event_no || '—')}；锁批状态 ${lockTag(l.status)}
+    </div>
+    <div class="trace-grid">
+      <div class="panel"><h3>① 品控复测记录（中心温度 / 感官状态）</h3><div class="panel-body">
+        ${l.retest_result ? `<dl class="kv">
+          <dt>复测中心温度</dt><dd>${fmtNum(l.retest_center_temp_c)} ℃</dd>
+          <dt>感官状态</dt><dd>${esc(l.retest_sensory)}</dd>
+          <dt>复测结论</dt><dd>${tag(l.retest_result)}</dd>
+          <dt>复测人</dt><dd>${esc(l.retest_by)}</dd>
+          <dt>时间</dt><dd>${esc(l.retest_at)}</dd>
+        </dl>` : '<div class="flow-note">尚未复测：该批暂停加工，等待品控复测中心温度与感官状态。</div>'}
+      </div></div>
+      <div class="panel"><h3>② 处置结论</h3><div class="panel-body">
+        ${l.disposition ? `<dl class="kv">
+          <dt>处置</dt><dd>${{ normal_release: '复测合格·正常放行', downgrade: '降级使用', destroy: '销毁' }[l.disposition]}</dd>
+          <dt>降级标签</dt><dd>${esc(l.downgrade_label || '—')}</dd>
+          <dt>限定渠道</dt><dd>${esc(l.downgrade_channels || '—')}</dd>
+          <dt>处置人</dt><dd>${esc(l.decided_by)}</dd>
+          <dt>时间</dt><dd>${esc(l.decided_at)}</dd>
+          <dt>依据</dt><dd>${esc(l.decide_note || '—')}</dd>
+        </dl>` : '<div class="flow-note">待处置：复测后可选择 放行 / 降级使用 / 销毁（与复测结论一致）。</div>'}
+      </div></div>
+      <div class="panel full"><h3>③ 锁批期间已进入半成品 · 隔离库位 / 检测结果 / 是否允许返工</h3><div class="panel-body">
+        ${table([
+          { t: '隔离单号', k: 'quarantine_no' }, { t: '隔离时工序', k: 'stage' },
+          { t: '数量kg', fn: r => fmtNum(r.qty_kg) }, { t: '隔离库位', k: 'location' },
+          { t: '检测结果', fn: r => r.test_result ? tag(r.test_result) : '<span class="tag amber">待检测</span>' },
+          { t: '允许返工', fn: r => r.test_result ? (r.rework_allowed ? '<span class="tag purple">允许返工</span>' : '<span class="tag red">不得返工</span>') : '—' },
+          { t: '状态', fn: r => tag(r.status) },
+          { t: '返工成品', k: 'reworked_batch_no' },
+          { t: '检测备注', k: 'test_note', cls: 'wrap' },
+          { t: '操作', fn: r => {
+            if (r.status !== 'isolated') return '—';
+            if (!r.test_result)
+              return canQC ? `<button class="act amber" data-semi-res="${r.id}">录入检测结果</button>` : '';
+            return (r.rework_allowed && canQC)
+              ? `<button class="act purple" data-semi-rw="${r.id}">返工并重新留样</button>`
+              : (canQC ? `<button class="act red" data-semi-des="${r.id}">半成品销毁</button>` : '');
+          } },
+        ], semiRows)}
+        ${canProd && l.status === 'pending' ? `<div class="form-actions"><button class="act" id="tl-semi">📥 登记半成品隔离（库位/工序/数量）</button></div>` : ''}
+      </div></div>
+      <div class="panel full"><h3>④ 降级标记：成品标签 / 销售渠道 / 成本核算</h3><div class="panel-body">
+        ${table([
+          { t: '标记号', k: 'mark_no' }, { t: '成品批号', k: 'finished_batch_no' },
+          { t: '成品标签', k: 'label_mark' }, { t: '限定渠道', k: 'channel_restriction' },
+          { t: '标准成本', fn: r => '¥' + fmtNum(r.standard_cost) },
+          { t: '降级单价/kg', fn: r => '¥' + fmtNum(r.unit_cost) },
+          { t: '降级损失', fn: r => `<b style="color:#b91c1c">¥${fmtNum(r.loss_amount)}</b>` },
+          { t: '备注', k: 'cost_note', cls: 'wrap' },
+        ], costRows)}
+      </div></div>
+    </div>
+    ${actionBar()}`);
+
+  const refresh = () => showThawLock(id);
+
+  $('#tl-retest')?.addEventListener('click', () => modalForm('品控复测 · 锁批 ' + l.lock_no, [
+    { name: 'center_temp_c', label: '复测中心温度℃', type: 'number', step: '0.01', def: '2.00' },
+    { name: 'sensory', label: '感官状态（色泽/气味/弹性）', full: true, ph: '如：色泽正常，无氨味，弹性略差' },
+    { name: 'result', label: '复测结论', type: 'select', full: true, opts: [
+      { v: 'qualified', t: '合格 — 可正常放行' },
+      { v: 'degrade', t: '建议降级 — 降级使用（标签/渠道/成本单独标记）' },
+      { v: 'unqualified', t: '不合格 — 必须销毁' }] },
+    { name: 'note', label: '复测说明', type: 'textarea', full: true },
+  ], async b => {
+    await api(`/thaw-locks/${id}/retest`, { method: 'POST', body: b });
+    toast('复测已录入，请继续提交处置结论', 'ok');
+    closeModal(); refresh();
+  }, '提交复测'));
+
+  $$('button[data-disp]').forEach(b => b.onclick = () => {
+    const disp = b.dataset.disp;
+    const fields = [{ name: 'note', label: '处置依据/备注', type: 'textarea', full: true }];
+    if (disp === 'downgrade') {
+      fields.unshift(
+        { name: 'downgrade_label', label: '降级成品标签字样', full: true, def: '降级品·解冻超时·限餐饮渠道' },
+        { name: 'downgrade_channels', label: '允许销售渠道（渠道 code，逗号分隔）', def: 'CH04',
+          ph: 'CH04=餐饮经销；留空默认仅 CH04' });
+    }
+    modalForm('锁批处置 · ' + ({ downgrade: '降级使用', destroy: '销毁', normal_release: '放行' }[disp]), fields,
+      async body => {
+        body.disposition = disp;
+        const r = await api(`/thaw-locks/${id}/dispose`, { method: 'POST', body });
+        toast('处置完成：' + r.status + (r.downgrade_label ? '；标签「' + r.downgrade_label + '」；限定渠道 ' + r.downgrade_channels : ''), 'ok');
+        closeModal(); render();
+      }, '确认处置');
+  });
+
+  $('#tl-semi')?.addEventListener('click', () => modalForm('登记半成品隔离 · 锁批 ' + l.lock_no, [
+    { name: 'stage', label: '隔离时所处工序', type: 'select', opts: Object.keys(STAGE).map(k => ({ v: k, t: STAGE[k] })) },
+    { name: 'qty_kg', label: '数量 kg', type: 'number', step: '0.01', def: '50' },
+    { name: 'location', label: '隔离库位 *', def: '冷库隔离区-Q02' },
+    { name: 'note', label: '现场情况备注', type: 'textarea', full: true },
+  ], async b => {
+    const r = await api(`/thaw-locks/${id}/semi`, { method: 'POST', body: b });
+    toast('半成品已隔离到 ' + r.location + '，等待检测与返工判定', 'err');
+    closeModal(); refresh();
+  }, '登记隔离'));
+
+  $$('button[data-semi-res]').forEach(b => b.onclick = () => modalForm('半成品检测结果 · 隔离单 ' + b.dataset.semiRes, [
+    { name: 'test_result', label: '检测结果', type: 'select', full: true, opts: [
+      { v: 'qualified', t: '合格（可决定是否允许返工）' }, { v: 'unqualified', t: '不合格（不得返工，只能销毁）' }] },
+    { name: 'rework_allowed', label: '是否允许返工', type: 'select',
+      opts: [{ v: 'true', t: '允许返工' }, { v: 'false', t: '不允许返工' }] },
+    { name: 'note', label: '检测说明（微生物/感官等）', type: 'textarea', full: true },
+  ], async body => {
+    body.rework_allowed = body.rework_allowed === 'true';
+    const r = await api(`/semi-quarantines/${b.dataset.semiRes}/result`, { method: 'POST', body: body });
+    toast(r.rework_allowed ? '检测合格，已标记允许返工' : '结果已录入（不允许返工）', r.rework_allowed ? 'ok' : 'err');
+    closeModal(); refresh();
+  }, '录入检测结果'));
+
+  $$('button[data-semi-rw]').forEach(b => b.onclick = () => modalForm('半成品返工 · 重新生成留样 · 隔离单 ' + b.dataset.semiRw, [
+    { name: 'batch_no', label: '返工成品批号 *' },
+    { name: 'qty_kg', label: '返工成品数量 kg', type: 'number', step: '0.01', def: '50' },
+    { name: 'cold_storage_location', label: '入冷库位', def: '冷库C-05' },
+    { name: 'packaging_spec', label: '包装规格（降级品需单独标识）', full: true, def: '降级品 1kg 简包' },
+    { name: 'sample_result', label: '返工留样检测结果', type: 'select', def: 'qualified',
+      opts: [{ v: 'qualified', t: '合格' }, { v: 'unqualified', t: '不合格' }, { v: '', t: '待检（pending）' }] },
+    { name: 'inspector', label: '检验员' },
+  ], async body => {
+    if (body.sample_result === '') body.sample_result = null;
+    const r = await api(`/semi-quarantines/${b.dataset.semiRw}/rework`, { method: 'POST', body });
+    toast(`返工成品 ${r.finished_batch_no} 已入库，重新生成留样 ${r.sample_no}` + (r.is_downgraded ? '；继承降级标记，渠道/成本单独核算' : ''), 'ok');
+    closeModal(); render();
+  }, '确认返工'));
+
+  $$('button[data-semi-des]').forEach(b => b.onclick = () => modalForm('半成品销毁 · 隔离单 ' + b.dataset.semiDes, [
+    { name: 'note', label: '销毁依据', type: 'textarea', full: true },
+  ], async body => {
+    await api(`/semi-quarantines/${b.dataset.semiDes}/destroy`, { method: 'POST', body });
+    toast('不合格半成品已销毁', 'err');
+    closeModal(); refresh();
+  }, '确认销毁'));
+}
+
 /* ---------- 成品批次 ---------- */
 
 async function pageFinished() {
@@ -391,6 +620,9 @@ async function pageFinished() {
       { t: '产量kg', fn: r => fmtNum(r.qty_kg) },
       { t: '可用库存kg', fn: r => fmtNum(r.stock_kg) },
       { t: '冷库库位', k: 'cold_storage_location' },
+      { t: '降级标记', fn: r => r.is_downgraded
+          ? `<span class="tag purple">降级品</span><div class="sub">${esc(r.downgrade_label || '')}｜限 ${esc(r.downgrade_channels || '')}</div>`
+          : '<span class="tag green">正常品</span>' },
       { t: '最新留样', k: 'latest_sample', tag: true },
       { t: '状态', k: 'status', tag: true },
       { t: '操作', fn: r => `<button class="act" data-trace="${esc(r.batch_no)}">反向追溯</button>` +
@@ -415,10 +647,13 @@ async function showFinTrace(bn) {
   const f = d.finished;
   modalView(`反向追溯 · 成品批次 ${bn}`, `
     <div class="trace-grid">
-      <div class="panel full"><h3>成品档案</h3><div class="panel-body"><dl class="kv" style="grid-template-columns:120px 1fr 120px 1fr">
+      <div class="panel full"><h3>成品档案${f.is_downgraded ? ' <span class="tag purple">降级品·标签/渠道/成本单独标记</span>' : ''}</h3><div class="panel-body"><dl class="kv" style="grid-template-columns:120px 1fr 120px 1fr">
         <dt>产品</dt><dd>${esc(f.product_name)}</dd><dt>批号</dt><dd>${esc(f.batch_no)}</dd>
         <dt>定制包装</dt><dd>${esc(f.packaging_spec)}</dd><dt>产量</dt><dd>${fmtNum(f.qty_kg)} kg</dd>
         <dt>冷库库位</dt><dd>${esc(f.cold_storage_location)}</dd><dt>状态</dt><dd>${tag(f.status)}</dd>
+        ${f.is_downgraded ? `<dt>降级标签</dt><dd>${esc(f.downgrade_label)}</dd>
+        <dt>限定销售渠道</dt><dd>${esc(f.downgrade_channels)}（发往其他渠道将被拦截）</dd>
+        <dt>降级说明</dt><dd>${esc(f.downgrade_note)}</dd>` : ''}
       </dl></div></div>
       <div class="panel full"><h3>使用的原料批次（供应商 / 入库 / 检疫）</h3><div class="panel-body">${table([
         { t: '原料批号', fn: x => `<button class="act" data-raw="${esc(x.batch_no)}">${esc(x.batch_no)}</button>` },
@@ -432,10 +667,19 @@ async function showFinTrace(bn) {
         { t: '时长(分)', fn: x => Number(x.duration_minutes) > 240 ? `<b style="color:#b91c1c">${x.duration_minutes} 超时</b>` : x.duration_minutes },
         { t: '中心温度℃', fn: x => fmtNum(x.center_temp_c) }, { t: '用水批次', k: 'water_batch_no' }, { t: '操作人', k: 'operator' },
       ], d.thaw_records)}</div></div>
-      <div class="panel"><h3>留样检测</h3><div class="panel-body">${table([
-        { t: '留样号', k: 'sample_no' }, { t: '结果', k: 'result', tag: true },
+      <div class="panel"><h3>留样检测（含返工成品重新留样）</h3><div class="panel-body">${table([
+        { t: '留样号', k: 'sample_no' },
+        { t: '留样类型', fn: x => x.sample_kind === 'rework' ? '<span class="tag purple">返工留样</span>' : '<span class="tag gray">正常留样</span>' },
+        { t: '结果', k: 'result', tag: true },
         { t: '检测时间', k: 'tested_at' }, { t: '检验员', k: 'inspector' }, { t: '备注', k: 'lab_note', cls: 'wrap' },
       ], d.samples)}</div></div>
+      <div class="panel full"><h3>降级成本单独标记（标签 / 渠道 / 成本核算）</h3><div class="panel-body">${table([
+        { t: '标记号', k: 'mark_no' }, { t: '成品标签', k: 'label_mark' }, { t: '限定渠道', k: 'channel_restriction' },
+        { t: '标准成本', fn: x => '¥' + fmtNum(x.standard_cost) },
+        { t: '降级单价/kg', fn: x => '¥' + fmtNum(x.unit_cost) },
+        { t: '降级损失', fn: x => `<b style="color:#b91c1c">¥${fmtNum(x.loss_amount)}</b>` },
+        { t: '备注', k: 'cost_note', cls: 'wrap' },
+      ], d.cost_marks)}</div></div>
       <div class="panel"><h3>在库/隔离库存</h3><div class="panel-body">${table([
         { t: '库位', k: 'location' }, { t: '数量kg', fn: x => fmtNum(x.qty_kg) }, { t: '状态', k: 'status', tag: true },
       ], d.inventory)}</div></div>

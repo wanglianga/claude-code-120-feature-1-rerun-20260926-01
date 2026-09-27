@@ -222,9 +222,25 @@ func (s *Server) rawTrace(w http.ResponseWriter, r *http.Request) {
 		                              WHERE raw_batch_id=(SELECT id FROM raw_material_batches WHERE batch_no=$1))
 		ORDER BY rc.initiated_at::text DESC`, batchNo)
 
+	thawLocks := queryMaps(`
+		SELECT tl.lock_no,p.plan_no,tl.duration_minutes,tl.allowed_minutes,tl.status,
+		       tl.retest_center_temp_c,tl.retest_sensory,tl.retest_result,tl.retest_by,tl.retest_at::text,
+		       tl.disposition,tl.downgrade_label,tl.downgrade_channels,tl.locked_at::text
+		FROM thaw_locks tl LEFT JOIN production_plans p ON p.id=tl.plan_id
+		WHERE tl.raw_batch_id=(SELECT id FROM raw_material_batches WHERE batch_no=$1)
+		ORDER BY tl.locked_at DESC`, batchNo)
+
+	costMarks := queryMaps(`
+		SELECT m.mark_no,fb.batch_no AS finished_batch_no,m.label_mark,m.channel_restriction,
+		       m.unit_cost,m.standard_cost,m.loss_amount,m.marked_at::text
+		FROM batch_cost_marks m LEFT JOIN finished_batches fb ON fb.id=m.finished_batch_id
+		WHERE m.raw_batch_id=(SELECT id FROM raw_material_batches WHERE batch_no=$1)
+		ORDER BY m.marked_at DESC`, batchNo)
+
 	writeJSON(w, 200, map[string]any{
 		"raw": raw, "temp_logs": tempLogs, "finished": finished,
 		"samples": samples, "shipments": shipments, "orders": orders,
 		"events": events, "recalls": recalls,
+		"thaw_locks": thawLocks, "cost_marks": costMarks,
 	})
 }

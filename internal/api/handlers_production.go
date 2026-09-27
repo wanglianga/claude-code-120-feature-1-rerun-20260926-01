@@ -21,8 +21,11 @@ func docNo(prefix string) string {
 func (s *Server) listPlans(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT p.id,p.plan_no,p.product_name,l.code,l.name,p.target_qty_kg,
-		       p.packaging_spec,p.required_seasoning_batch,p.status,p.planned_at::text
-		FROM production_plans p LEFT JOIN production_lines l ON l.id=p.line_id
+		       p.packaging_spec,p.required_seasoning_batch,p.status,p.planned_at::text,
+		       rb.batch_no AS locked_raw_batch_no
+		FROM production_plans p
+		LEFT JOIN production_lines l ON l.id=p.line_id
+		LEFT JOIN raw_material_batches rb ON rb.id=p.locked_raw_batch_id
 		ORDER BY p.planned_at DESC`)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -111,18 +114,40 @@ func (s *Server) addThaw(w http.ResponseWriter, r *http.Request) {
 	_, _ = s.pool.Exec(r.Context(),
 		`UPDATE production_plans SET status='thawing' WHERE id=$1 AND status='planned'`, planID)
 
-	// 解冻超过 4 小时（240 分钟）自动生成品控事件
+	// 解冻超过 4 小时（240 分钟）自动生成品控事件并锁批：
+	// 该批原料暂停进入加工线，等待品控复测中心温度与感官状态。
 	timeoutMin := int(end.Sub(start).Minutes())
 	alarmEvent := map[string]any{"id": id, "duration_minutes": timeoutMin}
 	if timeoutMin > 240 {
 		evNo := docNo("EV")
-		_, _ = s.pool.Exec(r.Context(), `
+		var evID int64
+		if err := s.pool.QueryRow(r.Context(), `
 			INSERT INTO quality_events(event_no,etype,severity,raw_batch_id,description,status,created_by)
-			VALUES($1,'thaw_timeout','major',$2,$3,'open',$4)`,
+			VALUES($1,'thaw_timeout','major',$2,$3,'open',$4) RETURNING id`,
 			evNo, rawID,
-			fmt.Sprintf("解冻用时 %d 分钟，超过限值 240 分钟（计划 %d，用水批次 %s）", timeoutMin, planID, req.WaterBatch),
-			u.ID)
-		alarmEvent["auto_event_no"] = evNo
+			fmt.Sprintf("解冻用时 %d 分钟，超过限值 240 分钟（计划 %d，用水批次 %s），暂停该批进入加工线并锁批待复测",
+				timeoutMin, planID, req.WaterBatch),
+			u.ID).Scan(&evID); err == nil {
+			alarmEvent["auto_event_no"] = evNo
+		}
+		lockNo := docNo("TL")
+		var lockID int64
+		if err := s.pool.QueryRow(r.Context(), `
+			INSERT INTO thaw_locks(lock_no,event_id,raw_batch_id,plan_id,thaw_record_id,
+			  duration_minutes,allowed_minutes,created_by)
+			VALUES($1,$2,$3,$4,$5,$6,240,$7) RETURNING id`,
+			lockNo, evID, rawID, planID, id, timeoutMin, u.ID).Scan(&lockID); err == nil {
+			alarmEvent["thaw_lock_no"] = lockNo
+			alarmEvent["locked"] = true
+		}
+		// 原料锁定（已耗用/已召回/已销毁的不回改状态，锁批档案仍保留）
+		_, _ = s.pool.Exec(r.Context(),
+			`UPDATE raw_material_batches SET status='locked'
+			 WHERE id=$1 AND status IN ('in_storage','locked','downgraded')`, rawID)
+		// 暂停该计划进入加工线
+		_, _ = s.pool.Exec(r.Context(),
+			`UPDATE production_plans SET status='locked',locked_raw_batch_id=$2
+			 WHERE id=$1 AND status NOT IN ('finished','cancelled')`, planID, rawID)
 	}
 	writeJSON(w, 201, alarmEvent)
 }
@@ -153,6 +178,21 @@ func (s *Server) addProcess(w http.ResponseWriter, r *http.Request) {
 		ok = *req.OK
 	}
 	u := currentUser(r)
+
+	// 锁批期间生产排程自动避开该原料：计划处于 locked 时拒绝继续加工，
+	// 须先在「解冻锁批」完成复测处置（放行/降级/销毁）。
+	var planStatus, lockedRaw string
+	_ = s.pool.QueryRow(r.Context(),
+		`SELECT COALESCE(p.status,''),COALESCE(rb.batch_no,'')
+		 FROM production_plans p LEFT JOIN raw_material_batches rb ON rb.id=p.locked_raw_batch_id
+		 WHERE p.id=$1`, planID).Scan(&planStatus, &lockedRaw)
+	if planStatus == "locked" {
+		writeErr(w, 409, fmt.Sprintf(
+			"计划 %d 因原料 %s 解冻超时已锁批暂停，加工线排程自动避开；请先完成品控复测与处置",
+			planID, lockedRaw))
+		return
+	}
+
 	var id int64
 	if err := s.pool.QueryRow(r.Context(), `
 		INSERT INTO process_records(plan_id,stage,operator,value_num,value_text,ok,note)
@@ -235,16 +275,75 @@ func (s *Server) finishPlan(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx)
 
-	var productName string
-	if err := tx.QueryRow(ctx, `SELECT product_name FROM production_plans WHERE id=$1`, planID).Scan(&productName); err != nil {
+	var productName, planStatus string
+	if err := tx.QueryRow(ctx,
+		`SELECT product_name,status FROM production_plans WHERE id=$1`, planID).
+		Scan(&productName, &planStatus); err != nil {
 		writeErr(w, 404, "生产计划不存在")
 		return
 	}
+	if planStatus == "locked" {
+		writeErr(w, 409, "计划因解冻超时锁批处于暂停状态，完工被排程拦截；请先在「解冻锁批」完成复测处置")
+		return
+	}
+
+	downgraded := false
+	var dgLabel, dgChannels string
+	var lockID int64
+	// 判断成品是否使用了降级原料（解冻超时复测降级）：
+	// 显式传入原料时逐一核对；缺省取本计划解冻记录原料时整体核对。
+	downgradeRawIDs := map[int64]bool{}
+	if len(req.RawUsages) > 0 {
+		for _, us := range req.RawUsages {
+			var rid int64
+			var st string
+			if err := tx.QueryRow(ctx,
+				`SELECT id,status FROM raw_material_batches WHERE batch_no=$1`, us.RawBatchNo).Scan(&rid, &st); err == nil && st == "downgraded" {
+				downgraded = true
+				downgradeRawIDs[rid] = true
+			}
+		}
+	} else {
+		drows, _ := tx.Query(ctx, `
+			SELECT DISTINCT rm.id FROM thaw_records t
+			JOIN raw_material_batches rm ON rm.id=t.raw_batch_id
+			WHERE t.plan_id=$1 AND rm.status='downgraded'`, planID)
+		for drows.Next() {
+			var rid int64
+			_ = drows.Scan(&rid)
+			downgraded = true
+			downgradeRawIDs[rid] = true
+		}
+		drows.Close()
+	}
+	if downgraded {
+		_ = tx.QueryRow(ctx, `
+			SELECT id,COALESCE(downgrade_label,'降级品·限定向渠道销售'),COALESCE(downgrade_channels,'CH04')
+			FROM thaw_locks
+			WHERE raw_batch_id=ANY($1::bigint[]) AND status='downgraded'
+			ORDER BY decided_at DESC LIMIT 1`,
+			mapKeys(downgradeRawIDs)).Scan(&lockID, &dgLabel, &dgChannels)
+		if lockID == 0 {
+			// 兼容手工标记的降级原料：仍给出默认标签与渠道
+			_ = tx.QueryRow(ctx, `
+				SELECT id,COALESCE(downgrade_label,'降级品·解冻超时复测降级'),COALESCE(downgrade_channels,'CH04')
+				FROM thaw_locks WHERE plan_id=$1 ORDER BY decided_at DESC LIMIT 1`, planID).
+				Scan(&lockID, &dgLabel, &dgChannels)
+			if lockID == 0 {
+				dgLabel, dgChannels = "降级品·解冻超时复测降级", "CH04"
+			}
+		}
+	}
+
 	var finID int64
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO finished_batches(batch_no,plan_id,product_name,packaging_spec,qty_kg,cold_storage_location,created_by)
-		VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-		req.BatchNo, planID, productName, req.PackagingSpec, req.QtyKg, req.ColdStorageLoc, u.ID).Scan(&finID); err != nil {
+		INSERT INTO finished_batches(batch_no,plan_id,product_name,packaging_spec,qty_kg,cold_storage_location,
+		  is_downgraded,downgrade_label,downgrade_channels,downgrade_note,created_by)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+		req.BatchNo, planID, productName, req.PackagingSpec, req.QtyKg, req.ColdStorageLoc,
+		downgraded, nullable(dgLabel), nullable(dgChannels),
+		map[bool]string{true: "使用解冻超时复测降级原料，降级使用", false: ""}[downgraded],
+		u.ID).Scan(&finID); err != nil {
 		writeErr(w, 400, "成品批次创建失败："+err.Error())
 		return
 	}
@@ -301,6 +400,23 @@ func (s *Server) finishPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 降级成品的成本核算单独标记（标准成本 40 元/kg，降级按 60%）
+	costMarkNo := ""
+	if downgraded {
+		var firstRaw int64
+		ids := mapKeys(downgradeRawIDs)
+		if len(ids) > 0 {
+			firstRaw = ids[0]
+		}
+		no, err := insertCostMark(ctx, tx, lockID, firstRaw, finID, req.QtyKg,
+			dgLabel, dgChannels, "解冻超时复测降级成品成本单独核算")
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		costMarkNo = no
+	}
+
 	if _, err := tx.Exec(ctx, `UPDATE production_plans SET status='finished' WHERE id=$1`, planID); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -312,5 +428,7 @@ func (s *Server) finishPlan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]any{
 		"finished_id": finID, "batch_no": req.BatchNo,
 		"sample_no": sampleNo, "sample_result": result,
+		"is_downgraded": downgraded, "downgrade_label": dgLabel,
+		"downgrade_channels": dgChannels, "cost_mark": costMarkNo != "",
 	})
 }
